@@ -27,35 +27,7 @@
 | Код | Значення | Безпекові імплікації |
 |---|---|---|
 | 200 OK | Успішно | — |
-| 301/302 | Redirect | **Open Redirect** якщо `Location` контролюється атакуючим |
-
-**Open Redirect** — вразливість, де параметр `next` або `url` у редіректі контролюється користувачем:
-
-```python
-# ❌ ВРАЗЛИВО
-@app.route('/login')
-def login():
-    next_url = request.args.get('next', '/')
-    # ...автентифікація...
-    return redirect(next_url)  # /login?next=https://evil.com
-
-# ✅ Перевіряємо, що next_url веде на наш сайт
-from urllib.parse import urlparse
-
-def is_safe_redirect(url: str) -> bool:
-    parsed = urlparse(url)
-    # Дозволяємо лише відносні URL або той самий хост
-    return not parsed.netloc or parsed.netloc == request.host
-
-@app.route('/login')
-def login():
-    next_url = request.args.get('next', '/')
-    if not is_safe_redirect(next_url):
-        next_url = '/'
-    return redirect(next_url)
-```
-
-Open Redirect використовується для фішингу («натисни на посилання bank.com/login?next=evil.com — виглядає як банк») і обходу `redirect_uri` whitelist в OAuth.
+| 301/302 | Redirect | Open Redirect якщо `Location` контролюється атакуючим |
 | 400 | Bad Request | Не розкривати деталі помилки у відповіді |
 | 401 | Unauthorized | Автентифікація потрібна |
 | 403 | Forbidden | Авторизований, але немає прав |
@@ -165,121 +137,7 @@ Content-Security-Policy:
 
 Детально CSP і всі Security Headers — розділ 6.10.
 
-## WebSockets: особливості безпеки
-
-**WebSocket** — протокол двостороннього зв'язку в реальному часі між браузером і сервером. На відміну від HTTP (один запит — одна відповідь), WebSocket-з'єднання залишається відкритим і дозволяє надсилати повідомлення в обидва боки.
-
-З точки зору безпеки WebSockets мають важливі відмінності від HTTP:
-
-**1. WebSocket Upgrade не підпадає під SOP для читання відповіді** — але браузер автоматично надсилає cookies і заголовки автентифікації при встановленні з'єднання (Upgrade request). Це означає, що CSRF-атака через WebSocket технічно можлива.
-
-**2. Відсутня вбудована авторизація після з'єднання** — після встановлення WebSocket-з'єднання сервер повинен самостійно перевіряти повноваження для кожного повідомлення. Без явної перевірки автентифікованого стану — будь-яка відкрита вкладка може надсилати повідомлення.
-
-```python
-# ✅ Правильна автентифікація WebSocket з'єднання
-from flask_socketio import SocketIO, disconnect
-from flask_login import current_user
-
-socketio = SocketIO(app)
-
-@socketio.on('connect')
-def handle_connect():
-    if not current_user.is_authenticated:
-        disconnect()  # відхилити неавтентифіковане з'єднання
-        return False
-    print(f"WebSocket connected: {current_user.id}")
-
-@socketio.on('message')
-def handle_message(data):
-    # Перевіряти авторизацію для КОЖНОГО повідомлення
-    if not current_user.can_access(data.get('resource')):
-        return {'error': 'Forbidden'}
-    # Валідація вхідних даних (injection через WebSocket теж можлива!)
-    if not isinstance(data.get('text'), str) or len(data['text']) > 1000:
-        return {'error': 'Invalid message'}
-    process_message(current_user, data['text'])
-```
-
-**3. Заголовок `Origin` перевіряти обов'язково** — при встановленні WebSocket-з'єднання:
-
-```python
-@socketio.on('connect')
-def handle_connect():
-    allowed_origins = {'https://example.com', 'https://app.example.com'}
-    origin = request.environ.get('HTTP_ORIGIN', '')
-    if origin not in allowed_origins:
-        disconnect()
-        return False
-```
-
-## Open Redirect: коли Location стає зброєю
-
-**Open Redirect** — вразливість, де параметр URL контролюється зловмисником і використовується для перенаправлення користувача на довільний сайт. Технічно не складна, але ефективна для фішингу: жертва бачить у посиланні легітимний домен `bank.com`, і лише після кліку потрапляє на `evil.com`.
-
-```
-# Вразливий URL:
-https://bank.com/login?next=https://evil.com
-
-# Сервер після логіну:
-return redirect(request.args['next'])  # ← переходимо куди завгодно
-```
-
-**Поширені вектори використання:**
-
-1. **Фішинг** — посилання виглядає як `bank.com`, але перенаправляє на клон-сайт.
-2. **OAuth redirect_uri обхід** — якщо Open Redirect є на авторизованому домені, `redirect_uri=https://bank.com/redirect?next=https://evil.com` може обійти whitelist перевірку.
-3. **SSRF підготовка** — у деяких конфігураціях Open Redirect на сервері дозволяє досягнути внутрішніх ресурсів.
-
-**Приклад і захист:**
-
-```python
-# ❌ ВРАЗЛИВО: редирект на будь-який URL з параметра
-from flask import redirect, request
-
-@app.route('/login')
-def login_redirect():
-    next_url = request.args.get('next', '/')
-    # ... логін ...
-    return redirect(next_url)  # атака: ?next=https://evil.com
-
-# ✅ Захист 1: перевірка що URL — відносний (починається з /)
-from urllib.parse import urlparse
-
-def is_safe_redirect(url: str) -> bool:
-    """Дозволяємо лише відносні URL або URL нашого домену."""
-    if not url:
-        return False
-    parsed = urlparse(url)
-    # Відносний URL: без схеми і хосту
-    if not parsed.netloc and not parsed.scheme:
-        return True
-    # Або явний whitelist наших доменів
-    ALLOWED_HOSTS = {'example.com', 'www.example.com'}
-    return parsed.netloc in ALLOWED_HOSTS
-
-@app.route('/login')
-def login_redirect():
-    next_url = request.args.get('next', '/')
-    if not is_safe_redirect(next_url):
-        next_url = '/'  # безпечний fallback
-    return redirect(next_url)
-
-# ✅ Захист 2: whitelist конкретних маршрутів (найсуворіший)
-ALLOWED_NEXT = {'/dashboard', '/profile', '/settings'}
-
-next_url = request.args.get('next', '/dashboard')
-if next_url not in ALLOWED_NEXT:
-    next_url = '/dashboard'
-```
-
-**Чому `url.startswith('/')` недостатньо:**
-```
-//evil.com  → починається з / але є абсолютним URL
-/\evil.com  → деякі браузери інтерпретують як //evil.com
-```
-Завжди використовуйте `urlparse` для надійної перевірки.
-
-
+## Sessionless vs Session-based автентифікація у вебі
 
 | Підхід | Як працює | Плюси | Ризики |
 |---|---|---|---|
